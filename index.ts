@@ -3,6 +3,7 @@ import * as fs from 'fs/promises';
 
 interface Config {
     codes: string[];
+    amounts?: number[];
     discordWebhookUrl: string;
 }
 
@@ -10,6 +11,7 @@ async function loadConfig(filePath: string): Promise<Config> {
     const content = await fs.readFile(filePath, 'utf-8');
     const lines = content.split('\n');
     let codes: string[] = [];
+    let amounts: number[] | undefined;
     let discordWebhookUrl = '';
 
     for (const line of lines) {
@@ -21,6 +23,8 @@ async function loadConfig(filePath: string): Promise<Config> {
 
         if (key.trim() === 'CODES') {
             codes = value.split(',').map(c => c.trim()).filter(c => c);
+        } else if (key.trim() === 'AMOUNTS') {
+            amounts = value.split(',').map(n => parseInt(n.trim(), 10));
         } else if (key.trim() === 'DISCORD_WEBHOOK_URL') {
             discordWebhookUrl = value;
         }
@@ -32,8 +36,11 @@ async function loadConfig(filePath: string): Promise<Config> {
     if (codes.length === 0) {
         throw new Error('CODES are missing in settings.conf');
     }
+    if (amounts && amounts.length !== codes.length) {
+        throw new Error(`The number of AMOUNTS (${amounts.length}) does not match the number of CODES (${codes.length})`);
+    }
 
-    return { codes, discordWebhookUrl };
+    return { codes, amounts, discordWebhookUrl };
 }
 
 async function fetchStockData(code: string): Promise<StockData | null> {
@@ -104,12 +111,39 @@ async function main() {
         const promises = config.codes.map(code => fetchStockData(code));
         const stockDataList = await Promise.all(promises);
 
-        for (const data of stockDataList) {
+        let totalValuation = 0;
+        let totalChange = 0;
+        let allDataAvailable = true;
+
+        stockDataList.forEach((data, index) => {
             if (data) {
                 // Format: 住友化学(株) (4005): 470円 (前日比 +5.5円 +1.18%)
                 const line = `${data.name} (${data.code}): ${data.price}円 (前日比 ${data.changeAmount}円 ${data.changePercent})`;
                 results.push(line);
+
+                if (config.amounts) {
+                    const amount = config.amounts[index];
+                    const priceVal = parseFloat(data.price.replace(/,/g, ''));
+                    const changeVal = parseFloat(data.changeAmount.replace(/,/g, '').replace('+', '')); // parseFloat handles + but being explicit is safe. Actually parseFloat handles leading + fine.
+
+                    if (!isNaN(priceVal) && !isNaN(changeVal)) {
+                        totalValuation += priceVal * amount;
+                        totalChange += changeVal * amount;
+                    } else {
+                        allDataAvailable = false;
+                        console.warn(`Failed to parse numbers for ${data.code}: price="${data.price}", change="${data.changeAmount}"`);
+                    }
+                }
+            } else {
+                allDataAvailable = false;
             }
+        });
+
+        if (config.amounts && allDataAvailable && results.length > 0) {
+            const totalChangeSign = totalChange > 0 ? '+' : '';
+            results.push(`評価額合計: ${totalValuation.toLocaleString()}円 (前日比 ${totalChangeSign}${totalChange.toLocaleString()}円)`);
+        } else if (config.amounts && !allDataAvailable) {
+            console.warn('Skipping total valuation calculation because some stock data is missing or invalid.');
         }
 
         if (results.length > 0) {
