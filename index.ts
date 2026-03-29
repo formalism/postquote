@@ -7,6 +7,13 @@ interface Config {
     discordWebhookUrl: string;
 }
 
+const DISCORD_MAX_LENGTH = 2000;
+const CODE_BLOCK_PREFIX = '```text\n';
+const CODE_BLOCK_SUFFIX = '\n```';
+
+/**
+ * settings.conf から株価取得対象と通知先の設定を読み込む。
+ */
 async function loadConfig(filePath: string): Promise<Config> {
     const content = await fs.readFile(filePath, 'utf-8');
     const lines = content.split('\n');
@@ -43,6 +50,9 @@ async function loadConfig(filePath: string): Promise<Config> {
     return { codes, amounts, discordWebhookUrl };
 }
 
+/**
+ * Yahoo!ファイナンスから指定銘柄の株価情報を取得する。
+ */
 async function fetchStockData(code: string): Promise<StockData | null> {
     const url = `https://finance.yahoo.co.jp/quote/${code}.T`;
     console.log(`Fetching data for ${code}...`);
@@ -60,29 +70,183 @@ async function fetchStockData(code: string): Promise<StockData | null> {
     }
 }
 
-async function sendToDiscord(webhookUrl: string, content: string) {
-    if (!content) return;
+interface TableRow {
+    code: string;
+    name: string;
+    price: string;
+    changeAmount: string;
+    changePercent: string;
+}
 
-    // Discord content limit is 2000 characters.
-    // We'll split simply by lines if needed, or just send chunks.
-    // Ideally, we batch lines until we hit the limit.
-    
-    const MAX_LENGTH = 2000;
-    const lines = content.split('\n');
-    let currentChunk = '';
+/**
+ * Discord の等幅コードブロック上で列が揃うよう、文字の表示幅を概算する。
+ */
+function getDisplayWidth(text: string): number {
+    let width = 0;
+
+    for (const char of text) {
+        width += isWideCharacter(char) ? 2 : 1;
+    }
+
+    return width;
+}
+
+/**
+ * 日本語などの全角文字を 2 桁幅として扱う。
+ */
+function isWideCharacter(char: string): boolean {
+    const codePoint = char.codePointAt(0);
+
+    if (codePoint === undefined) {
+        return false;
+    }
+
+    return (
+        (codePoint >= 0x1100 && codePoint <= 0x115f) ||
+        (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+        (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+        (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+        (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+        (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+        (codePoint >= 0xff01 && codePoint <= 0xff60) ||
+        (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    );
+}
+
+/**
+ * 列幅に合わせて末尾へ空白を補い、Discord 上で表の列位置を揃える。
+ */
+function padDisplayWidth(text: string, width: number): string {
+    const padding = Math.max(0, width - getDisplayWidth(text));
+    return `${text}${' '.repeat(padding)}`;
+}
+
+/**
+ * 数値列を右寄せにし、桁の比較をしやすくする。
+ */
+function padDisplayWidthStart(text: string, width: number): string {
+    const padding = Math.max(0, width - getDisplayWidth(text));
+    return `${' '.repeat(padding)}${text}`;
+}
+
+/**
+ * 株価一覧を 1 銘柄 1 行の表形式に変換する。
+ */
+export function formatStockTable(stockDataList: StockData[], totalRow?: { totalValuation: number; totalChange: number }): string[] {
+    const baseRows: TableRow[] = stockDataList.map(data => ({
+        code: data.code,
+        name: data.name,
+        price: `${data.price}円`,
+        changeAmount: `${data.changeAmount}円`,
+        changePercent: data.changePercent
+    }));
+
+    if (totalRow) {
+        const totalChangeSign = totalRow.totalChange > 0 ? '+' : '';
+        baseRows.push({
+            code: '',
+            name: '評価額合計',
+            price: `${totalRow.totalValuation.toLocaleString()}円`,
+            changeAmount: `${totalChangeSign}${totalRow.totalChange.toLocaleString()}円`,
+            changePercent: ''
+        });
+    }
+
+    const nameWidth = Math.max(getDisplayWidth('銘柄'), ...baseRows.map(row => getDisplayWidth(row.name)));
+    const rows = baseRows;
+
+    const codeWidth = Math.max(getDisplayWidth('コード'), ...rows.map(row => getDisplayWidth(row.code)));
+    const priceWidth = Math.max(getDisplayWidth('価格'), ...rows.map(row => getDisplayWidth(row.price)));
+    const changeAmountWidth = Math.max(getDisplayWidth('前日比'), ...rows.map(row => getDisplayWidth(row.changeAmount)));
+    const changePercentWidth = Math.max(getDisplayWidth('騰落率'), ...rows.map(row => getDisplayWidth(row.changePercent)));
+
+    const header = [
+        padDisplayWidth('価格', priceWidth),
+        padDisplayWidth('前日比', changeAmountWidth),
+        padDisplayWidth('騰落率', changePercentWidth),
+        padDisplayWidth('コード', codeWidth),
+        padDisplayWidth('銘柄', nameWidth)
+    ].join('  ');
+    const separator = [
+        '-'.repeat(priceWidth),
+        '-'.repeat(changeAmountWidth),
+        '-'.repeat(changePercentWidth),
+        '-'.repeat(codeWidth),
+        '-'.repeat(nameWidth)
+    ].join('  ');
+
+    const lines = [header, separator];
+
+    rows.forEach((row, index) => {
+        const isTotalRow = totalRow !== undefined && index === rows.length - 1;
+
+        if (isTotalRow) {
+            lines.push(separator);
+        }
+
+        lines.push([
+            padDisplayWidthStart(row.price, priceWidth),
+            padDisplayWidthStart(row.changeAmount, changeAmountWidth),
+            padDisplayWidthStart(row.changePercent, changePercentWidth),
+            padDisplayWidth(row.code, codeWidth),
+            padDisplayWidth(row.name, nameWidth)
+        ].join('  '));
+    });
+
+    return lines;
+}
+
+/**
+ * 表の各行を Discord のコードブロック単位で分割する。
+ */
+export function splitDiscordTable(lines: string[], maxLength = DISCORD_MAX_LENGTH): string[] {
+    if (lines.length === 0) {
+        return [];
+    }
+
+    const chunks: string[] = [];
+    let currentLines: string[] = [];
+
+    const flushCurrentLines = () => {
+        if (currentLines.length === 0) {
+            return;
+        }
+
+        chunks.push(`${CODE_BLOCK_PREFIX}${currentLines.join('\n')}${CODE_BLOCK_SUFFIX}`);
+        currentLines = [];
+    };
 
     for (const line of lines) {
-        if (currentChunk.length + line.length + 1 > MAX_LENGTH) {
-            await postChunk(webhookUrl, currentChunk);
-            currentChunk = '';
+        const candidateLines = currentLines.length === 0 ? [line] : [...currentLines, line];
+        const candidateChunk = `${CODE_BLOCK_PREFIX}${candidateLines.join('\n')}${CODE_BLOCK_SUFFIX}`;
+
+        if (candidateChunk.length > maxLength) {
+            flushCurrentLines();
+            currentLines = [line];
+        } else {
+            currentLines = candidateLines;
         }
-        currentChunk += line + '\n';
     }
-    if (currentChunk) {
-        await postChunk(webhookUrl, currentChunk);
+
+    flushCurrentLines();
+
+    return chunks;
+}
+
+/**
+ * 表形式の本文をコードブロック単位で分割しながら Discord Webhook に送信する。
+ */
+async function sendToDiscord(webhookUrl: string, lines: string[]) {
+    const chunks = splitDiscordTable(lines);
+
+    for (const chunk of chunks) {
+        await postChunk(webhookUrl, chunk);
     }
 }
 
+/**
+ * 単一チャンクの本文を Discord Webhook に POST する。
+ */
 async function postChunk(webhookUrl: string, content: string) {
     try {
         const response = await fetch(webhookUrl, {
@@ -100,16 +264,18 @@ async function postChunk(webhookUrl: string, content: string) {
     }
 }
 
+/**
+ * 設定された銘柄の株価取得、集計、Discord 通知をまとめて実行する。
+ */
 async function main() {
     try {
         const config = await loadConfig('settings.conf');
-        
-        const results: string[] = [];
-        
+
         // Fetch sequentially to be nice to the server, or parallel. 
         // Parallel is fine for a few codes.
         const promises = config.codes.map(code => fetchStockData(code));
         const stockDataList = await Promise.all(promises);
+        const validStockDataList: StockData[] = [];
 
         let totalValuation = 0;
         let totalChange = 0;
@@ -117,9 +283,7 @@ async function main() {
 
         stockDataList.forEach((data, index) => {
             if (data) {
-                // Format: 住友化学(株) (4005): 470円 (前日比 +5.5円 +1.18%)
-                const line = `${data.name} (${data.code}): ${data.price}円 (前日比 ${data.changeAmount}円 ${data.changePercent})`;
-                results.push(line);
+                validStockDataList.push(data);
 
                 if (config.amounts) {
                     const amount = config.amounts[index];
@@ -139,16 +303,16 @@ async function main() {
             }
         });
 
-        if (config.amounts && allDataAvailable && results.length > 0) {
-            const totalChangeSign = totalChange > 0 ? '+' : '';
-            results.push(`評価額合計: ${totalValuation.toLocaleString()}円 (前日比 ${totalChangeSign}${totalChange.toLocaleString()}円)`);
+        let totalRow: { totalValuation: number; totalChange: number } | undefined;
+        if (config.amounts && allDataAvailable && validStockDataList.length > 0) {
+            totalRow = { totalValuation, totalChange };
         } else if (config.amounts && !allDataAvailable) {
             console.warn('Skipping total valuation calculation because some stock data is missing or invalid.');
         }
 
-        if (results.length > 0) {
-            const message = results.join('\n');
-            await sendToDiscord(config.discordWebhookUrl, message);
+        if (validStockDataList.length > 0) {
+            const tableLines = formatStockTable(validStockDataList, totalRow);
+            await sendToDiscord(config.discordWebhookUrl, tableLines);
         } else {
             console.log('No stock data retrieved.');
         }
@@ -159,4 +323,6 @@ async function main() {
     }
 }
 
-main();
+if (import.meta.main) {
+    main();
+}

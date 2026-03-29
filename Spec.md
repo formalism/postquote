@@ -6,6 +6,11 @@
 
 アプリケーションはTypeScriptで記述し、[Bun](https://bun.sh/)で実行する。
 
+```
+bun i && bun build index.ts --compile --outfile postquote
+```
+とすると、postquoteという名前で実行バイナリを作成できる。
+
 ### 設定情報
 
 settings.confにテキストファイルとして設定を記入する
