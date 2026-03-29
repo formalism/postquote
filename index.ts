@@ -1,5 +1,7 @@
 import { parseStockHtml, type StockData } from './parser';
 import * as fs from 'fs/promises';
+import { Resvg } from '@resvg/resvg-js';
+import { createHash } from 'crypto';
 
 interface Config {
     codes: string[];
@@ -10,6 +12,24 @@ interface Config {
 const DISCORD_MAX_LENGTH = 2000;
 const CODE_BLOCK_PREFIX = '```text\n';
 const CODE_BLOCK_SUFFIX = '\n```';
+const TABLE_IMAGE_WIDTH = 1200;
+const TABLE_IMAGE_PADDING_X = 48;
+const TABLE_IMAGE_PADDING_Y = 40;
+const TABLE_HEADER_HEIGHT = 44;
+const TABLE_ROW_HEIGHT = 42;
+const TABLE_SEPARATOR_HEIGHT = 22;
+const EMBEDDED_FONT_FAMILY = 'Noto Sans CJK JP';
+const EMBEDDED_FONT_URL = 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf';
+const FONT_DOWNLOAD_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const FONT_CACHE_DIR = '.cache/fonts';
+
+interface PortfolioSummary {
+    totalValuation: number;
+    totalChange: number;
+}
+
+let cachedEmbeddedFontBuffer: Uint8Array | null = null;
+let cachedEmbeddedFontPath: string | null = null;
 
 /**
  * settings.conf から株価取得対象と通知先の設定を読み込む。
@@ -234,9 +254,264 @@ export function splitDiscordTable(lines: string[], maxLength = DISCORD_MAX_LENGT
 }
 
 /**
+ * HTML/XML 上で安全に扱えるよう、文字列中の記号をエスケープする。
+ */
+function escapeXml(text: string): string {
+    return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+}
+
+/**
+ * フォント URL ごとに安定したキャッシュファイル名を作る。
+ */
+export function buildFontCachePath(fontUrl: string, cacheDir = FONT_CACHE_DIR): string {
+    const url = new URL(fontUrl);
+    const fileName = url.pathname.split('/').pop() ?? '';
+    const extension = fileName.includes('.') ? fileName.split('.').pop() ?? 'bin' : 'bin';
+    const hash = createHash('sha256').update(fontUrl).digest('hex');
+    return `${cacheDir}/${hash}.${extension}`;
+}
+
+/**
+ * バイナリ中に UTF-8 / UTF-16 で family 名が含まれるかを確認する。
+ */
+function bufferContainsFontFamily(buffer: Uint8Array, familyName: string): boolean {
+    const utf8Text = Buffer.from(buffer).toString('utf8');
+    if (utf8Text.includes(familyName)) {
+        return true;
+    }
+
+    const utf16leText = Buffer.from(buffer).toString('utf16le');
+    if (utf16leText.includes(familyName)) {
+        return true;
+    }
+
+    const utf16beBytes: number[] = [];
+    for (let index = 0; index + 1 < buffer.length; index += 2) {
+        utf16beBytes.push(buffer[index + 1], buffer[index]);
+    }
+    const utf16beText = Buffer.from(utf16beBytes).toString('utf16le');
+    return utf16beText.includes(familyName);
+}
+
+/**
+ * キャッシュ済みフォントを読み込み、存在しない場合は null を返す。
+ */
+async function readCachedFont(fontUrl: string, cacheDir = FONT_CACHE_DIR): Promise<Uint8Array | null> {
+    const filePath = buildFontCachePath(fontUrl, cacheDir);
+
+    try {
+        return new Uint8Array(await fs.readFile(filePath));
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            return null;
+        }
+        throw error;
+    }
+}
+
+/**
+ * 不正なキャッシュフォントを削除する。
+ */
+async function deleteCachedFont(fontUrl: string, cacheDir = FONT_CACHE_DIR): Promise<void> {
+    const filePath = buildFontCachePath(fontUrl, cacheDir);
+
+    try {
+        await fs.unlink(filePath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+        }
+    }
+}
+
+/**
+ * 取得した Web フォントをローカルキャッシュへ保存する。
+ */
+async function writeCachedFont(fontUrl: string, buffer: Uint8Array, cacheDir = FONT_CACHE_DIR): Promise<void> {
+    const filePath = buildFontCachePath(fontUrl, cacheDir);
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.writeFile(filePath, buffer);
+}
+
+/**
+ * 埋め込み用フォントをキャッシュ優先で取得し、resvg が直接読めるローカルファイルとして確保する。
+ */
+async function ensureEmbeddedFontFile(fetcher: typeof fetch = fetch, cacheDir = FONT_CACHE_DIR): Promise<string> {
+    if (cachedEmbeddedFontPath) {
+        return cachedEmbeddedFontPath;
+    }
+
+    const filePath = buildFontCachePath(EMBEDDED_FONT_URL, cacheDir);
+    const cachedBuffer = await readCachedFont(EMBEDDED_FONT_URL, cacheDir);
+    if (cachedBuffer) {
+        if (bufferContainsFontFamily(cachedBuffer, EMBEDDED_FONT_FAMILY)) {
+            cachedEmbeddedFontBuffer = cachedBuffer;
+            cachedEmbeddedFontPath = filePath;
+            return filePath;
+        }
+
+        await deleteCachedFont(EMBEDDED_FONT_URL, cacheDir);
+    }
+
+    const fontResponse = await fetcher(EMBEDDED_FONT_URL, {
+        headers: {
+            'User-Agent': FONT_DOWNLOAD_USER_AGENT
+        }
+    });
+    if (!fontResponse.ok) {
+        throw new Error(`Failed to fetch embedded font: ${fontResponse.status} ${fontResponse.statusText}`);
+    }
+
+    const buffer = new Uint8Array(await fontResponse.arrayBuffer());
+    if (!bufferContainsFontFamily(buffer, EMBEDDED_FONT_FAMILY)) {
+        throw new Error(`Downloaded font does not contain expected family: ${EMBEDDED_FONT_FAMILY}`);
+    }
+
+    await writeCachedFont(EMBEDDED_FONT_URL, buffer, cacheDir);
+    cachedEmbeddedFontBuffer = buffer;
+    cachedEmbeddedFontPath = filePath;
+    return filePath;
+}
+
+/**
+ * Discord に描画する表の各行データを組み立てる。
+ */
+export function buildTableRows(stockDataList: StockData[], totalRow?: PortfolioSummary): TableRow[] {
+    const rows: TableRow[] = stockDataList.map(data => ({
+        code: data.code,
+        name: data.name,
+        price: `${data.price}円`,
+        changeAmount: `${data.changeAmount}円`,
+        changePercent: data.changePercent
+    }));
+
+    if (totalRow) {
+        const totalChangeSign = totalRow.totalChange > 0 ? '+' : '';
+        rows.push({
+            code: '',
+            name: '評価額合計',
+            price: `${totalRow.totalValuation.toLocaleString()}円`,
+            changeAmount: `${totalChangeSign}${totalRow.totalChange.toLocaleString()}円`,
+            changePercent: ''
+        });
+    }
+
+    return rows;
+}
+
+/**
+ * 株価一覧画像の 1 行を SVG の text 要素へ変換する。
+ */
+function buildRowSvg(row: TableRow, layout: {
+    xPrice: number;
+    xChangeAmount: number;
+    xChangePercent: number;
+    xCode: number;
+    xName: number;
+    nameWidth: number;
+    y: number;
+}): string {
+    const rowColor = row.code === '' ? '#f3f4f7' : '#e7e9ee';
+    const changeColor = row.changeAmount.startsWith('-') ? '#f38ba8' : row.changeAmount ? '#8bd5ca' : rowColor;
+
+    return `
+<text x="${layout.xPrice}" y="${layout.y}" fill="${rowColor}" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">${escapeXml(row.price)}</text>
+<text x="${layout.xChangeAmount}" y="${layout.y}" fill="${changeColor}" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">${escapeXml(row.changeAmount)}</text>
+<text x="${layout.xChangePercent}" y="${layout.y}" fill="${changeColor}" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">${escapeXml(row.changePercent)}</text>
+<text x="${layout.xCode}" y="${layout.y}" fill="${rowColor}" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">${escapeXml(row.code)}</text>
+<clipPath id="clip-name-${layout.y}">
+  <rect x="${layout.xName}" y="${layout.y - 30}" width="${layout.nameWidth}" height="36" />
+</clipPath>
+<text x="${layout.xName}" y="${layout.y}" fill="${rowColor}" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" clip-path="url(#clip-name-${layout.y})">${escapeXml(row.name)}</text>`;
+}
+
+/**
+ * 株価一覧画像の SVG を組み立てる。列は空白ではなく座標で揃える。
+ */
+export function buildStockTableSvg(rows: TableRow[]): string {
+    const priceWidth = 180;
+    const changeAmountWidth = 150;
+    const changePercentWidth = 120;
+    const codeWidth = 110;
+    const columnGap = 28;
+    const tableInnerWidth = TABLE_IMAGE_WIDTH - TABLE_IMAGE_PADDING_X * 2;
+    const nameWidth = tableInnerWidth - priceWidth - changeAmountWidth - changePercentWidth - codeWidth - columnGap * 4;
+    const xPrice = TABLE_IMAGE_PADDING_X + priceWidth;
+    const xChangeAmount = xPrice + columnGap + changeAmountWidth;
+    const xChangePercent = xChangeAmount + columnGap + changePercentWidth;
+    const xCode = xChangePercent + columnGap + codeWidth;
+    const xName = xCode + columnGap;
+    const separatorCount = rows.some(row => row.code === '') ? 2 : 1;
+    const imageHeight = TABLE_IMAGE_PADDING_Y * 2 + TABLE_HEADER_HEIGHT + rows.length * TABLE_ROW_HEIGHT + separatorCount * TABLE_SEPARATOR_HEIGHT;
+
+    const headerY = TABLE_IMAGE_PADDING_Y + 28;
+    const bodyStartY = TABLE_IMAGE_PADDING_Y + TABLE_HEADER_HEIGHT + 34;
+    let currentY = bodyStartY;
+    const bodyNodes: string[] = [];
+
+    rows.forEach((row, index) => {
+        const isTotalRow = row.code === '';
+
+        if (index === 0 || isTotalRow) {
+            const separatorY = currentY - 18;
+            bodyNodes.push(`<line x1="${TABLE_IMAGE_PADDING_X}" y1="${separatorY}" x2="${TABLE_IMAGE_WIDTH - TABLE_IMAGE_PADDING_X}" y2="${separatorY}" stroke="#8a93a7" stroke-width="1"/>`);
+            currentY += TABLE_SEPARATOR_HEIGHT;
+        }
+
+        bodyNodes.push(buildRowSvg(row, {
+            xPrice,
+            xChangeAmount,
+            xChangePercent,
+            xCode,
+            xName,
+            nameWidth,
+            y: currentY
+        }));
+        currentY += TABLE_ROW_HEIGHT;
+    });
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${TABLE_IMAGE_WIDTH}" height="${imageHeight}" viewBox="0 0 ${TABLE_IMAGE_WIDTH} ${imageHeight}" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100%" height="100%" rx="18" fill="#1f2430" />
+  <text x="${xPrice}" y="${headerY}" fill="#f3f4f7" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">価格</text>
+  <text x="${xChangeAmount}" y="${headerY}" fill="#f3f4f7" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">前日比</text>
+  <text x="${xChangePercent}" y="${headerY}" fill="#f3f4f7" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">騰落率</text>
+  <text x="${xCode}" y="${headerY}" fill="#f3f4f7" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}" text-anchor="end">コード</text>
+  <text x="${xName}" y="${headerY}" fill="#f3f4f7" font-size="28" font-family="${EMBEDDED_FONT_FAMILY}">銘柄</text>
+  ${bodyNodes.join('\n  ')}
+</svg>`;
+}
+
+/**
+ * 埋め込みフォント込みで SVG をレンダリングし、Discord 添付用の PNG データを生成する。
+ */
+export async function renderStockTablePng(rows: TableRow[], fetcher: typeof fetch = fetch, cacheDir = FONT_CACHE_DIR): Promise<Uint8Array> {
+    const svg = buildStockTableSvg(rows);
+    const fontFile = await ensureEmbeddedFontFile(fetcher, cacheDir);
+    const resvg = new Resvg(svg, {
+        fitTo: {
+            mode: 'width',
+            value: TABLE_IMAGE_WIDTH
+        },
+        font: {
+            loadSystemFonts: false,
+            defaultFontFamily: EMBEDDED_FONT_FAMILY,
+            fontFiles: [fontFile]
+        }
+    });
+
+    return resvg.render().asPng();
+}
+
+/**
  * 表形式の本文をコードブロック単位で分割しながら Discord Webhook に送信する。
  */
-async function sendToDiscord(webhookUrl: string, lines: string[]) {
+async function sendTextToDiscord(webhookUrl: string, lines: string[]) {
     const chunks = splitDiscordTable(lines);
 
     for (const chunk of chunks) {
@@ -262,6 +537,26 @@ async function postChunk(webhookUrl: string, content: string) {
     } catch (error) {
         console.error('Error posting to Discord:', error);
     }
+}
+
+/**
+ * PNG 画像を Discord Webhook に添付して送信する。
+ */
+async function sendImageToDiscord(webhookUrl: string, png: Uint8Array) {
+    const formData = new FormData();
+    formData.append('payload_json', JSON.stringify({ content: '株価一覧' }));
+    formData.append('files[0]', new File([png], 'stock-table.png', { type: 'image/png' }));
+
+    const response = await fetch(webhookUrl, {
+        method: 'POST',
+        body: formData
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to post image to Discord: ${response.status} ${await response.text()}`);
+    }
+
+    console.log('Successfully posted image to Discord.');
 }
 
 /**
@@ -303,7 +598,7 @@ async function main() {
             }
         });
 
-        let totalRow: { totalValuation: number; totalChange: number } | undefined;
+        let totalRow: PortfolioSummary | undefined;
         if (config.amounts && allDataAvailable && validStockDataList.length > 0) {
             totalRow = { totalValuation, totalChange };
         } else if (config.amounts && !allDataAvailable) {
@@ -311,8 +606,16 @@ async function main() {
         }
 
         if (validStockDataList.length > 0) {
-            const tableLines = formatStockTable(validStockDataList, totalRow);
-            await sendToDiscord(config.discordWebhookUrl, tableLines);
+            const rows = buildTableRows(validStockDataList, totalRow);
+
+            try {
+                const png = await renderStockTablePng(rows);
+                await sendImageToDiscord(config.discordWebhookUrl, png);
+            } catch (error) {
+                console.warn('Falling back to text table because image rendering or upload failed.', error);
+                const tableLines = formatStockTable(validStockDataList, totalRow);
+                await sendTextToDiscord(config.discordWebhookUrl, tableLines);
+            }
         } else {
             console.log('No stock data retrieved.');
         }
