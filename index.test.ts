@@ -1,8 +1,60 @@
 import { describe, expect, test } from 'bun:test';
-import { buildFontCachePath, buildStockTableSvg, buildTableRows, formatStockTable, renderStockTablePng, splitDiscordTable } from './index';
+import { buildFontCachePath, buildStockTableSvg, buildTableRows, formatStockTable, loadConfig, renderStockTablePng, splitDiscordTable } from './index';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * 一時ディレクトリへ設定ファイル群を書き出し、読み込みテスト用のパスを返す。
+ */
+async function createConfigFixture(settingsJson: string, envText: string) {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), 'postquote-config-'));
+    const settingsPath = path.join(fixtureDir, 'settings.json');
+    const envPath = path.join(fixtureDir, '.env');
+
+    await Promise.all([
+        fs.writeFile(settingsPath, settingsJson),
+        fs.writeFile(envPath, envText)
+    ]);
+
+    return { settingsPath, envPath };
+}
+
+describe('loadConfig', () => {
+    test('loads stock settings from settings.json', async () => {
+        const fixture = await createConfigFixture(`[
+            { "code": "3407", "amount": 200 },
+            { "code": "8473", "amount": 100 }
+        ]`, 'DISCORD_WEBHOOK_URL=https://example.com/webhook\n');
+
+        await expect(loadConfig(fixture.settingsPath)).resolves.toEqual([
+            { code: '3407', amount: 200 },
+            { code: '8473', amount: 100 }
+        ]);
+    });
+
+    test('allows omitting amount on individual records', async () => {
+        const fixture = await createConfigFixture(`[
+            { "code": "3407", "amount": 200 },
+            { "code": "8473" }
+        ]`, 'DISCORD_WEBHOOK_URL=https://example.com/webhook\n');
+
+        await expect(loadConfig(fixture.settingsPath)).resolves.toEqual([
+            { code: '3407', amount: 200 },
+            { code: '8473' }
+        ]);
+    });
+
+    test('rejects empty stock settings', async () => {
+        const fixture = await createConfigFixture(`[
+            
+        ]`, '# empty\n');
+
+        await expect(loadConfig(fixture.settingsPath)).rejects.toThrow(
+            'settings.json must contain at least one stock setting'
+        );
+    });
+});
 
 describe('formatStockTable', () => {
     test('formats stock rows as a single-line table without truncating names', () => {

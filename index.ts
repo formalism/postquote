@@ -3,10 +3,9 @@ import * as fs from 'fs/promises';
 import { Resvg } from '@resvg/resvg-js';
 import { createHash } from 'crypto';
 
-interface Config {
-    codes: string[];
-    amounts?: number[];
-    discordWebhookUrl: string;
+interface StockSetting {
+    code: string;
+    amount?: number;
 }
 
 const DISCORD_MAX_LENGTH = 2000;
@@ -30,44 +29,90 @@ interface PortfolioSummary {
 
 let cachedEmbeddedFontBuffer: Uint8Array | null = null;
 let cachedEmbeddedFontPath: string | null = null;
+let discordWebhookUrl = '';
 
 /**
- * settings.conf から株価取得対象と通知先の設定を読み込む。
+ * .env の `KEY=VALUE` 形式を読み取り、必要な環境変数を抽出する。
  */
-async function loadConfig(filePath: string): Promise<Config> {
+async function loadEnvFile(filePath: string): Promise<Record<string, string>> {
     const content = await fs.readFile(filePath, 'utf-8');
-    const lines = content.split('\n');
-    let codes: string[] = [];
-    let amounts: number[] | undefined;
-    let discordWebhookUrl = '';
+    const env: Record<string, string> = {};
 
-    for (const line of lines) {
+    for (const line of content.split('\n')) {
         const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-
-        const [key, ...valueParts] = trimmed.split('=');
-        const value = valueParts.join('=').trim();
-
-        if (key.trim() === 'CODES') {
-            codes = value.split(',').map(c => c.trim()).filter(c => c);
-        } else if (key.trim() === 'AMOUNTS') {
-            amounts = value.split(',').map(n => parseInt(n.trim(), 10));
-        } else if (key.trim() === 'DISCORD_WEBHOOK_URL') {
-            discordWebhookUrl = value;
+        if (!trimmed || trimmed.startsWith('#')) {
+            continue;
         }
+
+        const separatorIndex = trimmed.indexOf('=');
+        if (separatorIndex < 0) {
+            continue;
+        }
+
+        const key = trimmed.slice(0, separatorIndex).trim();
+        const value = trimmed.slice(separatorIndex + 1).trim();
+        env[key] = value;
     }
+
+    return env;
+}
+
+/**
+ * settings.json の各要素を検証し、後続処理で扱える設定へ正規化する。
+ */
+function parseStockSettings(jsonText: string): StockSetting[] {
+    const parsed = JSON.parse(jsonText) as unknown;
+
+    if (!Array.isArray(parsed)) {
+        throw new Error('settings.json must contain an array');
+    }
+
+    return parsed.map((entry, index) => {
+        if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+            throw new Error(`settings.json[${index}] must be an object`);
+        }
+
+        const { code, amount } = entry as Record<string, unknown>;
+
+        if (typeof code !== 'string' || code.trim() === '') {
+            throw new Error(`settings.json[${index}].code must be a non-empty string`);
+        }
+
+        if (amount !== undefined && (!Number.isFinite(amount) || typeof amount !== 'number')) {
+            throw new Error(`settings.json[${index}].amount must be a finite number when provided`);
+        }
+
+        return {
+            code: code.trim(),
+            amount
+        };
+    });
+}
+
+/**
+ * `.env` から Discord Webhook URL を読み込み、モジュール内へ保持する。
+ */
+async function loadDiscordWebhookUrl(envPath: string): Promise<void> {
+    const env = await loadEnvFile(envPath);
+    discordWebhookUrl = env.DISCORD_WEBHOOK_URL ?? '';
 
     if (!discordWebhookUrl) {
-        throw new Error('DISCORD_WEBHOOK_URL is missing in settings.conf');
+        throw new Error('DISCORD_WEBHOOK_URL is missing in .env');
     }
-    if (codes.length === 0) {
-        throw new Error('CODES are missing in settings.conf');
-    }
-    if (amounts && amounts.length !== codes.length) {
-        throw new Error(`The number of AMOUNTS (${amounts.length}) does not match the number of CODES (${codes.length})`);
+}
+
+/**
+ * `settings.json` から株価取得対象の設定一覧を読み込む。
+ */
+export async function loadConfig(settingsPath: string): Promise<StockSetting[]> {
+    const settingsContent = await fs.readFile(settingsPath, 'utf-8');
+    const stockSettings = parseStockSettings(settingsContent);
+
+    if (stockSettings.length === 0) {
+        throw new Error('settings.json must contain at least one stock setting');
     }
 
-    return { codes, amounts, discordWebhookUrl };
+    return stockSettings;
 }
 
 /**
@@ -564,24 +609,28 @@ async function sendImageToDiscord(webhookUrl: string, png: Uint8Array) {
  */
 async function main() {
     try {
-        const config = await loadConfig('settings.conf');
+        await loadDiscordWebhookUrl('.env');
+        const stockSettings = await loadConfig('settings.json');
 
         // Fetch sequentially to be nice to the server, or parallel. 
         // Parallel is fine for a few codes.
-        const promises = config.codes.map(code => fetchStockData(code));
+        const promises = stockSettings.map(setting => fetchStockData(setting.code));
         const stockDataList = await Promise.all(promises);
         const validStockDataList: StockData[] = [];
 
         let totalValuation = 0;
         let totalChange = 0;
-        let allDataAvailable = true;
+        let allAmountDataAvailable = true;
+        let hasAmountSetting = false;
 
         stockDataList.forEach((data, index) => {
+            const stockSetting = stockSettings[index];
+
             if (data) {
                 validStockDataList.push(data);
-
-                if (config.amounts) {
-                    const amount = config.amounts[index];
+                if (stockSetting?.amount !== undefined) {
+                    hasAmountSetting = true;
+                    const amount = stockSetting.amount;
                     const priceVal = parseFloat(data.price.replace(/,/g, ''));
                     const changeVal = parseFloat(data.changeAmount.replace(/,/g, '').replace('+', '')); // parseFloat handles + but being explicit is safe. Actually parseFloat handles leading + fine.
 
@@ -589,19 +638,20 @@ async function main() {
                         totalValuation += priceVal * amount;
                         totalChange += changeVal * amount;
                     } else {
-                        allDataAvailable = false;
+                        allAmountDataAvailable = false;
                         console.warn(`Failed to parse numbers for ${data.code}: price="${data.price}", change="${data.changeAmount}"`);
                     }
                 }
-            } else {
-                allDataAvailable = false;
+            } else if (stockSetting?.amount !== undefined) {
+                hasAmountSetting = true;
+                allAmountDataAvailable = false;
             }
         });
 
         let totalRow: PortfolioSummary | undefined;
-        if (config.amounts && allDataAvailable && validStockDataList.length > 0) {
+        if (hasAmountSetting && allAmountDataAvailable && validStockDataList.length > 0) {
             totalRow = { totalValuation, totalChange };
-        } else if (config.amounts && !allDataAvailable) {
+        } else if (hasAmountSetting && !allAmountDataAvailable) {
             console.warn('Skipping total valuation calculation because some stock data is missing or invalid.');
         }
 
@@ -610,11 +660,11 @@ async function main() {
 
             try {
                 const png = await renderStockTablePng(rows);
-                await sendImageToDiscord(config.discordWebhookUrl, png);
+                await sendImageToDiscord(discordWebhookUrl, png);
             } catch (error) {
                 console.warn('Falling back to text table because image rendering or upload failed.', error);
                 const tableLines = formatStockTable(validStockDataList, totalRow);
-                await sendTextToDiscord(config.discordWebhookUrl, tableLines);
+                await sendTextToDiscord(discordWebhookUrl, tableLines);
             }
         } else {
             console.log('No stock data retrieved.');
