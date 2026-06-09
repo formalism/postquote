@@ -19,7 +19,8 @@ export function parseStockHtml(html: string, code: string): StockData {
     const price = $('[class*="PriceBoard__price"] [class*="StyledNumber__value"]').first().text().trim();
 
     // Change Amount: <span class="PriceChangeLabel__primary..."><span class="StyledNumber__value...">+5.5</span>
-    const changeAmount = $('[class*="PriceChangeLabel__primary"] [class*="StyledNumber__value"]').text().trim();
+    // Yahoo!ファイナンスは夜間PTSなど複数の PriceChangeLabel を出すため、先頭の東証欄だけを読む。
+    const changeAmount = $('[class*="PriceChangeLabel__primary"]').first().find('[class*="StyledNumber__value"]').first().text().trim();
 
     // Change Percent: <span class="PriceChangeLabel__secondary..."><span class="StyledNumber__value...">+1.18</span>
     // Note: The HTML might include brackets "()" or "%" in other spans. The text() might capture them if we select the parent.
@@ -27,8 +28,9 @@ export function parseStockHtml(html: string, code: string): StockData {
     // My selector for primary/secondary targets the inner number value. 
     // Let's grab the value. The "%" is usually in a sibling span suffix.
     
-    const changePercentValue = $('[class*="PriceChangeLabel__secondary"] [class*="StyledNumber__value"]').text().trim();
-    const changePercentSuffix = $('[class*="PriceChangeLabel__secondary"] [class*="StyledNumber__suffix"]').text().trim() || '%';
+    const changePercentNode = $('[class*="PriceChangeLabel__secondary"]').first();
+    const changePercentValue = changePercentNode.find('[class*="StyledNumber__value"]').first().text().trim();
+    const changePercentSuffix = changePercentNode.find('[class*="StyledNumber__suffix"]').first().text().trim() || '%';
     
     const changePercent = `${changePercentValue}${changePercentSuffix}`;
 

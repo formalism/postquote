@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { buildFontCachePath, buildStockTableSvg, buildTableRows, formatStockTable, loadConfig, renderStockTablePng, splitDiscordTable } from './index';
+import { parseStockHtml } from './parser';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -53,6 +54,42 @@ describe('loadConfig', () => {
         await expect(loadConfig(fixture.settingsPath)).rejects.toThrow(
             'settings.json must contain at least one stock setting'
         );
+    });
+});
+
+describe('parseStockHtml', () => {
+    test('uses the first price change label when Yahoo also renders night PTS data', () => {
+        const html = `
+            <h2 class="PriceBoard__name__abc">旭化成(株)</h2>
+            <span class="PriceBoard__price__abc">
+                <span class="StyledNumber__value__abc">1,716</span>
+            </span>
+            <span class="PriceChangeLabel__primary__abc">
+                <span class="StyledNumber__value__abc">-30</span>
+            </span>
+            <span class="PriceChangeLabel__secondary__abc">
+                <span class="StyledNumber__value__abc">-1.72</span>
+                <span class="StyledNumber__suffix__abc">%</span>
+            </span>
+            <span class="PriceBoard__price__pts">
+                <span class="StyledNumber__value__abc">1,727</span>
+            </span>
+            <span class="PriceChangeLabel__primary__pts">
+                <span class="StyledNumber__value__abc">+11</span>
+            </span>
+            <span class="PriceChangeLabel__secondary__pts">
+                <span class="StyledNumber__value__abc">+0.64</span>
+                <span class="StyledNumber__suffix__abc">%</span>
+            </span>
+        `;
+
+        expect(parseStockHtml(html, '3407')).toEqual({
+            name: '旭化成(株)',
+            code: '3407',
+            price: '1,716',
+            changeAmount: '-30',
+            changePercent: '-1.72%'
+        });
     });
 });
 
